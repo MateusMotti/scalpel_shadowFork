@@ -4,7 +4,13 @@ import { BrowserWindow, ipcMain, screen, webContents } from 'electron'
 import { OVERLAY_WINDOW_OPTS, OverlayController } from 'electron-overlay-window'
 import { uIOhook, type UiohookMouseEvent } from 'uiohook-napi'
 import { startClientLogWatcher } from './client-log'
-import { guardNativeListener, recordMainBreadcrumb, registerDiagnosticProvider } from './diagnostics'
+import {
+  guardNativeListener,
+  recordMainBreadcrumb,
+  recordMainDiagnostic,
+  registerDiagnosticProvider,
+} from './diagnostics'
+import { type PointerSnapshot, readWindowsPointer, windowsPointerPollAvailable } from './desktop/windows-pointer-poll'
 import { setGameAttached } from './game-presence'
 import { getPoeVersion, setPoeVersion } from './game-state'
 import { loadTierData, refreshTierData } from './tier-data'
@@ -286,6 +292,7 @@ let hyprlandPointerTimer: ReturnType<typeof setTimeout> | null = null
 
 // Input counters for issue #648 diagnostics: `total*` since launch, the rest
 // per overlay show. Summarised as a breadcrumb in hideOverlay().
+let lastHookMouseEventAt = 0
 const inputStats = {
   totalMove: 0,
   totalDrag: 0,
@@ -308,6 +315,7 @@ uIOhook.on('input', (e: { type: number; x?: number; y?: number }) => {
   else if (e.type === 7) inputStats.totalDown++
   else if (e.type === 11) inputStats.totalWheel++
   else return
+  lastHookMouseEventAt = Date.now()
   if (!overlayVisible) return
   if (moved) {
     inputStats.move++
@@ -400,47 +408,98 @@ function logHitTestOnce(x: number, y: number): void {
 // Close overlay when clicking outside the panel
 // Use mousedown (not click) so the overlay hides immediately on press,
 // before PoE grabs focus and causes a flash.
-uIOhook.on(
-  'mousedown',
-  guardNativeListener('mousedown-overlay', (e) => {
-    if (!overlayVisible && !desktop.hasInteractiveDialog() && hyprlandInputAllowed()) {
-      const point = hyprlandOverlayActive() ? getHyprlandPointerPhysical() : e
-      if (point && !windowAtPoint(point.x, point.y) && (OverlayController.targetHasFocus || hyprlandOverlayActive())) {
-        if (hideOverlaysOnGameClick()) {
-          setInteractiveWindow(null)
-          desktop.focusGame()
-        }
+const overlayMouseDownListener = guardNativeListener('mousedown-overlay', (e: UiohookMouseEvent) => {
+  if (!overlayVisible && !desktop.hasInteractiveDialog() && hyprlandInputAllowed()) {
+    const point = hyprlandOverlayActive() ? getHyprlandPointerPhysical() : e
+    if (point && !windowAtPoint(point.x, point.y) && (OverlayController.targetHasFocus || hyprlandOverlayActive())) {
+      if (hideOverlaysOnGameClick()) {
+        setInteractiveWindow(null)
+        desktop.focusGame()
       }
     }
-    if (!overlayVisible) return
-    if (!hyprlandInputAllowed()) return
-    logHitTestOnce(e.x, e.y)
-    // Only process clicks while the panel is on screen in the game's focus context
-    // (see mainOverlayHitTestable for why this avoids overlayWindow.isVisible()).
-    if (!mainOverlayHitTestable()) return
-    if (!isInsidePanel(e.x, e.y)) {
-      // A click on any visible Scalpel secondary overlay (cheat sheets etc.) is
-      // an interaction with our app, not a "click outside" - don't hide.
-      if (isInsideAnySecondaryOverlay(e.x, e.y)) return
-      // A native <select> dropdown is open -- its option list lives outside our reported
-      // panel rect, so every click on it looks like a click "outside". Bail so we don't
-      // disable interactivity (click-through to PoE) or close the overlay.
-      if (interactiveLocked) return
-      if (hyprlandOverlayActive()) {
-        hideOverlay()
-        return
-      }
-      // Ensure click-through is enabled so the click reaches the game
-      if (mouseOverPanel) {
-        mouseOverPanel = false
-        setInteractive(false)
-      }
-      if (closeOnClickOutside) {
-        hideOverlay()
-      }
+  }
+  if (!overlayVisible) return
+  if (!hyprlandInputAllowed()) return
+  logHitTestOnce(e.x, e.y)
+  // Only process clicks while the panel is on screen in the game's focus context
+  // (see mainOverlayHitTestable for why this avoids overlayWindow.isVisible()).
+  if (!mainOverlayHitTestable()) return
+  if (!isInsidePanel(e.x, e.y)) {
+    // A click on any visible Scalpel secondary overlay (cheat sheets etc.) is
+    // an interaction with our app, not a "click outside" - don't hide.
+    if (isInsideAnySecondaryOverlay(e.x, e.y)) return
+    // A native <select> dropdown is open -- its option list lives outside our reported
+    // panel rect, so every click on it looks like a click "outside". Bail so we don't
+    // disable interactivity (click-through to PoE) or close the overlay.
+    if (interactiveLocked) return
+    if (hyprlandOverlayActive()) {
+      hideOverlay()
+      return
     }
-  }),
-)
+    // Ensure click-through is enabled so the click reaches the game
+    if (mouseOverPanel) {
+      mouseOverPanel = false
+      setInteractive(false)
+    }
+    if (closeOnClickOutside) {
+      hideOverlay()
+    }
+  }
+})
+uIOhook.on('mousedown', overlayMouseDownListener)
+
+// Windows fallback for a dead uiohook mouse hook (issue #648). Windows can
+// silently drop a WH_MOUSE_LL hook, after which uiohook delivers no mouse
+// events at all (keyboard keeps working), so the panel never turns interactive
+// and click-outside never fires. While the main overlay is shown we poll the
+// cursor and button state directly and feed the same handlers. Moves are
+// idempotent; synthesized presses are skipped while the hook is demonstrably
+// alive so a click is never handled twice.
+const POINTER_POLL_MS = 25
+const HOOK_ALIVE_WINDOW_MS = 1000
+let pointerPollTimer: ReturnType<typeof setInterval> | null = null
+let pointerPollLast: PointerSnapshot | null = null
+let pointerPollFeeds = 0
+
+function pollPointer(): void {
+  const snap = readWindowsPointer()
+  if (!snap) return
+  const prev = pointerPollLast
+  pointerPollLast = snap
+  const hookAlive = Date.now() - lastHookMouseEventAt < HOOK_ALIVE_WINDOW_MS
+  const base = { x: snap.x, y: snap.y, clicks: 0 } as unknown as UiohookMouseEvent
+  if (!prev || prev.x !== snap.x || prev.y !== snap.y) {
+    if (!hookAlive) pointerPollFeeds++
+    trackPointerListener(base)
+  }
+  if (!prev || hookAlive) return
+  for (const button of [1, 2, 3] as const) {
+    if (snap.buttons[button] && !prev.buttons[button]) {
+      pointerPollFeeds++
+      overlayMouseDownListener({ ...base, button } as UiohookMouseEvent)
+    }
+  }
+}
+
+function startPointerPoll(): void {
+  if (pointerPollTimer || process.platform !== 'win32' || hyprlandOverlayActive()) return
+  if (!windowsPointerPollAvailable()) return
+  pointerPollLast = null
+  pointerPollFeeds = 0
+  pointerPollTimer = setInterval(() => {
+    try {
+      pollPointer()
+    } catch (err) {
+      recordMainDiagnostic('overlay-pointer-poll', err)
+    }
+  }, POINTER_POLL_MS)
+}
+
+function stopPointerPoll(): void {
+  if (pointerPollTimer) clearInterval(pointerPollTimer)
+  pointerPollTimer = null
+  pointerPollLast = null
+}
 
 /** The PoE version the overlay's native tracker bound to at createOverlayWindow
  *  time. In single-title (stable) mode electron-overlay-window attaches once per
@@ -750,6 +809,7 @@ export function showOverlay(): void {
   inputStats.down = 0
   inputStats.wheel = 0
   inputStats.lastMove = '-'
+  startPointerPoll()
   lastShowTime = Date.now()
   // Call the overridden showInactive() to properly reset opacityHidden and restore visibility.
   // Direct setOpacity(1) alone doesn't reset the closure flag, so the next hide/show cycle
@@ -791,7 +851,7 @@ export function hideOverlay(): void {
       .map((r) => `${Math.round(r.left)},${Math.round(r.top)}-${Math.round(r.right)},${Math.round(r.bottom)}`)
       .join(' ')
     recordMainBreadcrumb(
-      `overlay session end: move=${inputStats.move} drag=${inputStats.drag} down=${inputStats.down} wheel=${inputStats.wheel} ` +
+      `overlay session end: pollFeeds=${pointerPollFeeds} move=${inputStats.move} drag=${inputStats.drag} down=${inputStats.down} wheel=${inputStats.wheel} ` +
         `lastMove=${inputStats.lastMove} totals(move/drag/down/wheel)=${inputStats.totalMove}/${inputStats.totalDrag}/${inputStats.totalDown}/${inputStats.totalWheel} ` +
         `hitTestable=${mainOverlayHitTestable()} isVisible=${overlayWindow.isVisible()} ` +
         `opacityHidden=${mainOverlayOpacityHidden} targetHasFocus=${OverlayController.targetHasFocus} ` +
@@ -799,6 +859,7 @@ export function hideOverlay(): void {
         `target=${tb?.x},${tb?.y},${tb?.width}x${tb?.height} sf=${getScaleFactor()} rects=[${rects}]`,
     )
   } catch {}
+  stopPointerPoll()
   overlayVisible = false
   mouseOverPanel = false
   if (hyprlandOverlayActive()) {
