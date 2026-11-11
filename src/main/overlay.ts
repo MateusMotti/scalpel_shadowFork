@@ -2,7 +2,7 @@ import { desktop } from './desktop'
 import { join } from 'node:path'
 import { BrowserWindow, ipcMain, screen, webContents } from 'electron'
 import { OVERLAY_WINDOW_OPTS, OverlayController } from 'electron-overlay-window'
-import { uIOhook } from 'uiohook-napi'
+import { uIOhook, type UiohookMouseEvent } from 'uiohook-napi'
 import { startClientLogWatcher } from './client-log'
 import { guardNativeListener, recordMainBreadcrumb, registerDiagnosticProvider } from './diagnostics'
 import { setGameAttached } from './game-presence'
@@ -284,57 +284,97 @@ let exitTimer: ReturnType<typeof setTimeout> | null = null
 let lastHyprlandPointerCheck = 0
 let hyprlandPointerTimer: ReturnType<typeof setTimeout> | null = null
 
-uIOhook.on(
-  'mousemove',
-  guardNativeListener('mousemove', function trackPointer(e) {
-    // A dialog owns input until explicitly dismissed. Hit-test updates can lag
-    // behind dragging; neither leaving a rect nor stale geometry may release it.
-    if (hyprlandOverlayActive() && overlayVisible) return
-    if (hyprlandOverlayActive() && desktop.hasInteractiveDialog()) {
-      setInteractiveWindow(null)
+// Input counters for issue #648 diagnostics: `total*` since launch, the rest
+// per overlay show. Summarised as a breadcrumb in hideOverlay().
+const inputStats = {
+  totalMove: 0,
+  totalDrag: 0,
+  totalDown: 0,
+  totalWheel: 0,
+  move: 0,
+  drag: 0,
+  down: 0,
+  wheel: 0,
+  lastMove: '-',
+}
+uIOhook.on('input', (e: { type: number; x?: number; y?: number }) => {
+  // libuiohook event types: 7 pressed, 9 moved, 10 dragged, 11 wheel.
+  const moved = e.type === 9 || e.type === 10
+  if (e.type === 10) {
+    inputStats.totalDrag++
+    if (overlayVisible) inputStats.drag++
+  }
+  if (moved) inputStats.totalMove++
+  else if (e.type === 7) inputStats.totalDown++
+  else if (e.type === 11) inputStats.totalWheel++
+  else return
+  if (!overlayVisible) return
+  if (moved) {
+    inputStats.move++
+    inputStats.lastMove = `${e.x},${e.y}`
+  } else if (e.type === 7) inputStats.down++
+  else inputStats.wheel++
+})
+
+const trackPointerListener = guardNativeListener('mousemove', function trackPointer(e: UiohookMouseEvent) {
+  // A dialog owns input until explicitly dismissed. Hit-test updates can lag
+  // behind dragging; neither leaving a rect nor stale geometry may release it.
+  if (hyprlandOverlayActive() && overlayVisible) return
+  if (hyprlandOverlayActive() && desktop.hasInteractiveDialog()) {
+    setInteractiveWindow(null)
+    return
+  }
+  // No rects reported yet -- skip hit testing. (Whiteboard registers its own
+  // rects independently of the main overlay's `overlayVisible` flag.)
+  if (panelRectsBySender.size === 0) return
+  let point = e
+  if (hyprlandOverlayActive()) {
+    // Limit compositor queries for high polling-rate gaming mice.
+    const elapsed = Date.now() - lastHyprlandPointerCheck
+    if (elapsed < 32) {
+      // Sample once more after the last motion event, even if the pointer
+      // stops immediately upon entering a button or drag grip.
+      if (!hyprlandPointerTimer)
+        hyprlandPointerTimer = setTimeout(() => {
+          hyprlandPointerTimer = null
+          trackPointer(e)
+        }, 32 - elapsed)
       return
     }
-    // No rects reported yet -- skip hit testing. (Whiteboard registers its own
-    // rects independently of the main overlay's `overlayVisible` flag.)
-    if (panelRectsBySender.size === 0) return
-    let point = e
-    if (hyprlandOverlayActive()) {
-      // Limit compositor queries for high polling-rate gaming mice.
-      const elapsed = Date.now() - lastHyprlandPointerCheck
-      if (elapsed < 32) {
-        // Sample once more after the last motion event, even if the pointer
-        // stops immediately upon entering a button or drag grip.
-        if (!hyprlandPointerTimer)
-          hyprlandPointerTimer = setTimeout(() => {
-            hyprlandPointerTimer = null
-            trackPointer(e)
-          }, 32 - elapsed)
-        return
-      }
-      lastHyprlandPointerCheck = Date.now()
-      const cursor = getHyprlandPointerPhysical()
-      if (!cursor) return
-      point = { ...e, ...cursor }
+    lastHyprlandPointerCheck = Date.now()
+    const cursor = getHyprlandPointerPhysical()
+    if (!cursor) return
+    point = { ...e, ...cursor }
+  }
+  const winUnder = windowAtPoint(point.x, point.y)
+  if (winUnder) {
+    if (exitTimer) {
+      clearTimeout(exitTimer)
+      exitTimer = null
     }
-    const winUnder = windowAtPoint(point.x, point.y)
-    if (winUnder) {
-      if (exitTimer) {
-        clearTimeout(exitTimer)
-        exitTimer = null
-      }
-      if (currentInteractiveWindow !== winUnder) {
-        mouseOverPanel = true
-        setInteractiveWindow(winUnder)
-      }
-    } else if (currentInteractiveWindow && !exitTimer) {
-      exitTimer = setTimeout(() => {
-        exitTimer = null
-        mouseOverPanel = false
-        if (!interactiveLocked) setInteractiveWindow(null)
-      }, 50)
+    if (currentInteractiveWindow !== winUnder) {
+      mouseOverPanel = true
+      setInteractiveWindow(winUnder)
     }
-  }),
-)
+  } else if (currentInteractiveWindow && !exitTimer) {
+    exitTimer = setTimeout(() => {
+      exitTimer = null
+      mouseOverPanel = false
+      if (!interactiveLocked) setInteractiveWindow(null)
+    }, 50)
+  }
+})
+
+uIOhook.on('mousemove', trackPointerListener)
+// uiohook-napi's JS layer only emits 'mousemove' for EVENT_MOUSE_MOVED and drops
+// EVENT_MOUSE_DRAGGED (type 10) entirely. libuiohook reports every move as
+// "dragged" while it believes a mouse button is held, and that button mask can
+// get stuck (e.g. a release missed while the hook was stopped), which leaves
+// hover-to-interact dead for the whole session (issue #648). Treat drags as
+// moves so hit testing keeps running either way.
+uIOhook.on('input', (e) => {
+  if ((e as { type: number }).type === 10) trackPointerListener(e as UiohookMouseEvent)
+})
 
 // One breadcrumb per overlay show describing the first click's hit test, so a
 // diagnostics report shows why the panel did or didn't react (issue #648).
@@ -706,6 +746,10 @@ export function showOverlay(): void {
   if (wb && !wb.getPersistOverOthers()) wb.hide()
   overlayVisible = true
   hitTestLoggedForShow = false
+  inputStats.move = 0
+  inputStats.down = 0
+  inputStats.wheel = 0
+  inputStats.lastMove = '-'
   lastShowTime = Date.now()
   // Call the overridden showInactive() to properly reset opacityHidden and restore visibility.
   // Direct setOpacity(1) alone doesn't reset the closure flag, so the next hide/show cycle
@@ -741,6 +785,20 @@ export function showOverlay(): void {
 
 export function hideOverlay(): void {
   if (!overlayWindow || overlayWindow.isDestroyed() || !overlayVisible) return
+  try {
+    const tb = OverlayController.targetBounds
+    const rects = flatPanelRects()
+      .map((r) => `${Math.round(r.left)},${Math.round(r.top)}-${Math.round(r.right)},${Math.round(r.bottom)}`)
+      .join(' ')
+    recordMainBreadcrumb(
+      `overlay session end: move=${inputStats.move} drag=${inputStats.drag} down=${inputStats.down} wheel=${inputStats.wheel} ` +
+        `lastMove=${inputStats.lastMove} totals(move/drag/down/wheel)=${inputStats.totalMove}/${inputStats.totalDrag}/${inputStats.totalDown}/${inputStats.totalWheel} ` +
+        `hitTestable=${mainOverlayHitTestable()} isVisible=${overlayWindow.isVisible()} ` +
+        `opacityHidden=${mainOverlayOpacityHidden} targetHasFocus=${OverlayController.targetHasFocus} ` +
+        `interactive=${currentInteractiveWindow === overlayWindow} senders=${panelRectsBySender.size} ` +
+        `target=${tb?.x},${tb?.y},${tb?.width}x${tb?.height} sf=${getScaleFactor()} rects=[${rects}]`,
+    )
+  } catch {}
   overlayVisible = false
   mouseOverPanel = false
   if (hyprlandOverlayActive()) {
