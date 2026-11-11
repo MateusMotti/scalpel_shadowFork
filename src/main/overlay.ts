@@ -4,7 +4,7 @@ import { BrowserWindow, ipcMain, screen, webContents } from 'electron'
 import { OVERLAY_WINDOW_OPTS, OverlayController } from 'electron-overlay-window'
 import { uIOhook } from 'uiohook-napi'
 import { startClientLogWatcher } from './client-log'
-import { guardNativeListener, registerDiagnosticProvider } from './diagnostics'
+import { guardNativeListener, recordMainBreadcrumb, registerDiagnosticProvider } from './diagnostics'
 import { setGameAttached } from './game-presence'
 import { getPoeVersion, setPoeVersion } from './game-state'
 import { loadTierData, refreshTierData } from './tier-data'
@@ -88,13 +88,34 @@ function flatPanelRects(): PhysRect[] {
   return out
 }
 
+/** Mirrors the opacity-hide closure flag of the main overlay (see createOverlayWindow). */
+let mainOverlayOpacityHidden = false
+
+/** Whether the main overlay panel should take part in pointer hit testing.
+ *
+ *  Deliberately does NOT use the patched overlayWindow.isVisible(): on some
+ *  Windows setups (issue #648) it reports false while the panel is on screen,
+ *  which silently disables both hover-to-interact and click-outside-to-close.
+ *  Instead we trust Scalpel's own `overlayVisible` state and require the game
+ *  (or a Scalpel window) to be focused, so an opacity-hidden overlay left
+ *  behind by an alt-tab can never swallow clicks meant for another app. */
+function mainOverlayHitTestable(): boolean {
+  if (!overlayWindow || overlayWindow.isDestroyed() || !overlayVisible) return false
+  if (hyprlandOverlayActive()) return true
+  return OverlayController.targetHasFocus || isAnyScalpelWindowFocused()
+}
+
 /** Return the window that owns the topmost rect containing (x, y), or null. */
 function windowAtPoint(x: number, y: number): BrowserWindow | null {
   for (const entry of panelRectsBySender.values()) {
-    // A hidden window keeps its last reported rects until its renderer clears
-    // them, and must not be made interactive on the strength of stale geometry.
-    if (entry.win.isDestroyed() || !entry.win.isVisible()) continue
-    if (hyprlandOverlayActive() && entry.win === overlayWindow && !overlayVisible) continue
+    if (entry.win.isDestroyed()) continue
+    if (entry.win === overlayWindow) {
+      if (!mainOverlayHitTestable()) continue
+    } else if (!entry.win.isVisible()) {
+      // A hidden window keeps its last reported rects until its renderer clears
+      // them, and must not be made interactive on the strength of stale geometry.
+      continue
+    }
     for (const r of entry.rects) {
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
         return entry.win
@@ -315,6 +336,27 @@ uIOhook.on(
   }),
 )
 
+// One breadcrumb per overlay show describing the first click's hit test, so a
+// diagnostics report shows why the panel did or didn't react (issue #648).
+let hitTestLoggedForShow = true
+function logHitTestOnce(x: number, y: number): void {
+  if (hitTestLoggedForShow) return
+  hitTestLoggedForShow = true
+  try {
+    const tb = OverlayController.targetBounds
+    const rects = flatPanelRects()
+      .map((r) => `${Math.round(r.left)},${Math.round(r.top)}-${Math.round(r.right)},${Math.round(r.bottom)}`)
+      .join(' ')
+    recordMainBreadcrumb(
+      `overlay hit-test click=${x},${y} inside=${isInsidePanel(x, y)} hitTestable=${mainOverlayHitTestable()} ` +
+        `isVisible=${overlayWindow?.isVisible()} opacityHidden=${mainOverlayOpacityHidden} ` +
+        `targetHasFocus=${OverlayController.targetHasFocus} scalpelFocused=${isAnyScalpelWindowFocused()} ` +
+        `interactive=${currentInteractiveWindow === overlayWindow} ` +
+        `target=${tb?.x},${tb?.y},${tb?.width}x${tb?.height} sf=${getScaleFactor()} rects=[${rects}]`,
+    )
+  } catch {}
+}
+
 // Close overlay when clicking outside the panel
 // Use mousedown (not click) so the overlay hides immediately on press,
 // before PoE grabs focus and causes a flash.
@@ -332,8 +374,10 @@ uIOhook.on(
     }
     if (!overlayVisible) return
     if (!hyprlandInputAllowed()) return
-    // Only process clicks if the overlay window is actually visible on screen
-    if (!overlayWindow || overlayWindow.isDestroyed() || !overlayWindow.isVisible()) return
+    logHitTestOnce(e.x, e.y)
+    // Only process clicks while the panel is on screen in the game's focus context
+    // (see mainOverlayHitTestable for why this avoids overlayWindow.isVisible()).
+    if (!mainOverlayHitTestable()) return
     if (!isInsidePanel(e.x, e.y)) {
       // A click on any visible Scalpel secondary overlay (cheat sheets etc.) is
       // an interaction with our app, not a "click outside" - don't hide.
@@ -433,6 +477,7 @@ export function createOverlayWindow(version: 1 | 2 = 1, options?: CreateOverlayO
   unmapHyprlandDialog = () => {
     origHide()
     opacityHidden = true
+    mainOverlayOpacityHidden = true
   }
 
   overlayWindow.hide = () => {
@@ -455,6 +500,7 @@ export function createOverlayWindow(version: 1 | 2 = 1, options?: CreateOverlayO
     exitTimer = null
 
     opacityHidden = true
+    mainOverlayOpacityHidden = true
     if (onGameBlur) setImmediate(onGameBlur)
   }
 
@@ -465,6 +511,7 @@ export function createOverlayWindow(version: 1 | 2 = 1, options?: CreateOverlayO
     // Restore opacity before showing so it's visible immediately
     overlayWindow?.setOpacity(1)
     opacityHidden = false
+    mainOverlayOpacityHidden = false
 
     overlayWindow?.setSkipTaskbar(true)
     origShowInactive()
@@ -658,6 +705,7 @@ export function showOverlay(): void {
   const wb = getWhiteboardOverlay()
   if (wb && !wb.getPersistOverOthers()) wb.hide()
   overlayVisible = true
+  hitTestLoggedForShow = false
   lastShowTime = Date.now()
   // Call the overridden showInactive() to properly reset opacityHidden and restore visibility.
   // Direct setOpacity(1) alone doesn't reset the closure flag, so the next hide/show cycle
@@ -830,7 +878,10 @@ function getOverlayDiagnostics(): Record<string, unknown> {
     overlayWindowCreated: overlayWindow !== null,
     overlayVisible,
     targetHasFocus: OverlayController.targetHasFocus,
-    targetBounds: tb?.width ? { width: tb.width, height: tb.height } : null,
+    targetBounds: tb?.width ? { x: tb.x, y: tb.y, width: tb.width, height: tb.height } : null,
+    overlayOpacityHidden: mainOverlayOpacityHidden,
+    overlayIsVisible: overlayWindow && !overlayWindow.isDestroyed() ? overlayWindow.isVisible() : null,
+    overlayHitTestable: mainOverlayHitTestable(),
     targetDisplayScaleFactor: sf,
     attachedPoeVersion: getPoeVersion(),
     lastAttachAt: lastAttachAt || null,
